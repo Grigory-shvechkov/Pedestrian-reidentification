@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parent
 
 # ─── Camera ──────────────────────────────────────────────────────────────────
 CAMERA_INDEX = 0            # int for a webcam, or a str path / RTSP URL
+TEST_VIDEO = str(ROOT / "videos" / "test_reid.mp4")   # "Use test video" button in the UI
 CAMERA_BACKEND = "dshow"    # "dshow" (fast open on Windows) | "msmf" | "any"
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
@@ -25,8 +26,10 @@ DETECT_LOW_CONFIDENCE = 0.25  # ByteTrack 2nd stage: keeps tracks alive through 
 DEVICE = "auto"             # "auto" | "cpu" | "cuda" | "0"
 
 # ─── Zone (optional; drawn in the UI, otherwise the full frame is used) ───────
-ZONE_ANCHOR = "center"      # which point of the bbox must be inside the zone: "center" | "bottom"
-ROI_PAD = 40                # px padding around the zone's bounding rect for the YOLO crop
+# Draw the zone on the floor: a person counts when their feet ("bottom") are inside it.
+ZONE_ANCHOR = "bottom"      # which point of the bbox must be inside the zone: "bottom" | "center"
+ROI_PAD = 120               # px around the zone for the YOLO crop (with "bottom" it also extends to the frame top)
+ZONES_PATH = ROOT / "data" / "zones.json"   # zones saved per video source
 
 # ─── Tracker (Kalman + Hungarian, ByteTrack-style) ───────────────────────────
 TRACK_MATCH_IOU = 0.30      # 1st stage (high-confidence detections)
@@ -55,24 +58,26 @@ MAX_DECISION_WAIT_S = 6.0   # force a decision this long after the first good cr
 # "auto": OSNet (weights auto-downloaded to MODELS_DIR on first run) → MobileNet fallback.
 # "osnet" / "mobilenet": force one.
 EMBEDDER_BACKEND = "auto"
-# osnet_x0_25_msmt17    – fast; threshold validated on videos/test_reid.mp4 (default)
-# osnet_ain_x1_0_msmt17 – stronger on new cameras, ~4× slower; recalibrate the threshold
+# osnet_ain_x1_0_msmt17 – default; ~4× slower than x0_25 but separates similar outfits (see threshold note)
+# osnet_x0_25_msmt17    – fast; confuses people dressed alike (e.g. two men in black)
 # also: osnet_x1_0_msmt17, osnet_x1_0_market1501, osnet_x0_25_market1501
-REID_MODEL = "osnet_x0_25_msmt17"
+REID_MODEL = "osnet_ain_x1_0_msmt17"
 MODELS_DIR = ROOT / "models"
 REID_INPUT_HW = (256, 128)
 FLIP_TTA = True             # average the embedding with its horizontal flip
 
 # Weight of the colour descriptor in the fused cosine similarity:
 #   cos(fused) = (1 - w) * cos(deep) + w * cos(colour)
-COLOR_WEIGHT = {"osnet": 0.25, "mobilenet": 0.50}
+# Kept low: for dark/achromatic outfits colour is near-identical between people and drowns out the deep feature.
+COLOR_WEIGHT = {"osnet": 0.10, "mobilenet": 0.50}
 WHITE_BALANCE = True        # grey-world gains estimated on the whole frame, not the crop
 
 # ─── Re-identification ───────────────────────────────────────────────────────
 # Cosine threshold for "seen before", per model (falls back to the family key). (CALIBRATE)
-# 0.80 for osnet_x0_25 comes from the test video: same person 0.94–0.97, different
-# people ≤ 0.76, except two men both dressed in black seen from behind (0.88–0.93).
-SIMILARITY_THRESHOLD = {"osnet_x0_25_msmt17": 0.80, "osnet": 0.75, "mobilenet": 0.85}
+# Test video, colour w=0.10: osnet_ain_x1_0 same person ≥ 0.95, two men in black 0.84, others ≤ 0.75.
+# osnet_x0_25 (w=0.25): same person ≥ 0.91, but the men in black score 0.90 – they get merged.
+SIMILARITY_THRESHOLD = {"osnet_ain_x1_0_msmt17": 0.88, "osnet_x0_25_msmt17": 0.80,
+                        "osnet": 0.75, "mobilenet": 0.85}
 AMBIGUOUS_BAND = 0.05       # best sim in [thr - band, thr) → keep collecting samples
 MIN_MARGIN = 0.03           # best must beat 2nd-best profile by this much (else keep collecting)
 REVISIT_GAP_S = 10.0        # profile must be unseen this long for a match to count as a new visit
@@ -83,7 +88,8 @@ BANNER_SECONDS = 3.0
 
 # ─── Database ────────────────────────────────────────────────────────────────
 DB_PATH = ROOT / "data" / "visitors_v2.db"   # new schema; old JSON-embedding DB is not reused
-DB_RESET_ON_START = True
+DB_RESET_ON_START = False   # keep visitors across restarts, so "seen today" survives a restart
+TEST_DB_PATH = ROOT / "data" / "test_video.db"   # the test video uses its own, always-fresh visitor list
 # Visitors unseen for this many days are deleted on start-up (None = keep forever).
 # Keeps the gallery small (fewer false matches) and limits how long appearance data is held.
 PROFILE_RETENTION_DAYS = 30
@@ -97,6 +103,11 @@ CROPS_DIR = ROOT / "data" / "crops"
 # ─── Integrations ────────────────────────────────────────────────────────────
 API_URL = None              # e.g. "http://localhost:8000/visitors"; None → log only
 API_TIMEOUT_S = 3.0
+
+# ─── Audio cue: person in the zone not seen yet today (see src/audio_cue.py) ─
+AUDIO_CUE_ENABLED = True
+AUDIO_CUE_SOUND = "beep"    # "beep" (Windows system sound) | path to a .wav | None
+AUDIO_CUE_URL = None        # e.g. "http://localhost:8000/audio-cue" – receives the event as JSON POST
 
 # ─── UI ──────────────────────────────────────────────────────────────────────
 UI_POLL_MS = 30

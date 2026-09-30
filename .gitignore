@@ -9,3 +9,4 @@ data/one-by-one-person-detection.mp4
 models/*.pth
 !models/.gitkeep
 !data/.gitkeep
+data/zones.json

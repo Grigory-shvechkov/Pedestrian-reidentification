@@ -20,6 +20,8 @@ import cv2
 import numpy as np
 
 from . import quality
+from .audio_cue import play_cue
+from .database import _midnight_ts
 from .embedder import l2n, white_balance_gains
 
 log = logging.getLogger(__name__)
@@ -121,16 +123,34 @@ class Pipeline:
         self._stats_ts = 0.0
         self._visible_ids: set[int] = set()
         self._track_profile: dict[int, int] = {}   # track id → visitor id, once decided
+        self.cam = None
+        self._view_since = 0.0
 
     # ── setup ─────────────────────────────────────────────────────────────
     def _init(self):
+        self.init_models()
+        log.info("Pipeline ready: %s, threshold %.2f", self.embedder.signature, self.embedder.threshold)
+        self._open_source(self.cfg.CAMERA_INDEX)
+
+    def _open_source(self, source):
+        """Switch to a webcam index / video path. On failure the pipeline idles so the UI can pick another."""
         from .camera import Camera
 
-        self.init_models()
+        if self.cam is not None:
+            self.cam.release()
+            self.cam = None
         c = self.cfg
         self._emit({"status": "Opening camera…"})
-        self.cam = Camera(c.CAMERA_INDEX, c.FRAME_WIDTH, c.FRAME_HEIGHT, c.CAMERA_BACKEND)
-        log.info("Pipeline ready: %s, threshold %.2f", self.embedder.signature, self.embedder.threshold)
+        try:
+            self.cam = Camera(source, c.FRAME_WIDTH, c.FRAME_HEIGHT, c.CAMERA_BACKEND)
+        except RuntimeError as e:
+            log.error("%s", e)
+            self._emit({"status": f"{e} – try 'Use test video'"})
+            return
+        self._every = max(1, round(self.cam.fps / max(c.DETECT_HZ, 0.1)))
+        self._last_seq, self._frame_i, self._eof_reported = -1, 0, False
+        self._last_frame_t, self._stall_reported = time.monotonic(), False
+        log.info("Source %r at %.0f fps → detecting every %d frame(s)", source, self.cam.fps, self._every)
 
     def init_models(self):
         """Load detector, embedder, database, tracker (everything except the camera).
@@ -145,13 +165,31 @@ class Pipeline:
         self.detector = PersonDetector(c.DETECTOR_WEIGHTS, c.DETECT_LOW_CONFIDENCE, c.DETECT_IMGSZ, c.DEVICE)
         self._emit({"status": "Loading re-ID model (first run downloads OSNet weights)…"})
         self.embedder = Embedder(c, resolve_device(c.DEVICE))
-        self.db = VisitorDB(c.DB_PATH, reset=c.DB_RESET_ON_START)
+        path, reset = self._db_for(c.CAMERA_INDEX)
+        self.db = VisitorDB(path, reset=reset)
         self.db.ensure_signature(self.embedder.signature, self.embedder.dim)
         if c.PROFILE_RETENTION_DAYS:
             self.db.prune(time.time() - c.PROFILE_RETENTION_DAYS * 86400)
         self._new_reid()
         self.tracker = Tracker(c.PERSON_CONFIDENCE, c.TRACK_MATCH_IOU, c.TRACK_LOW_MATCH_IOU,
                                c.TRACK_MIN_HITS, c.TRACK_MAX_AGE, c.TRACK_MAX_CENTER_DIST)
+
+    def _db_for(self, source):
+        c = self.cfg
+        if isinstance(source, str) and Path(source).resolve() == Path(c.TEST_VIDEO).resolve():
+            return c.TEST_DB_PATH, True
+        return c.DB_PATH, c.DB_RESET_ON_START
+
+    def _switch_db(self, source):
+        from .database import VisitorDB
+
+        path, reset = self._db_for(source)
+        if Path(self.db.path).resolve() == Path(path).resolve() and not reset:
+            return
+        self.db.close()
+        self.db = VisitorDB(path, reset=reset)
+        self.db.ensure_signature(self.embedder.signature, self.embedder.dim)
+        self._new_reid()
 
     def _new_reid(self):
         from .re_identifier import ReIdentifier
@@ -169,20 +207,30 @@ class Pipeline:
             self._shutdown()
 
     def _loop(self):
-        n = max(1, round(self.cam.fps / max(self.cfg.DETECT_HZ, 0.1)))
-        log.info("Source %.0f fps → detecting every %d frame(s)", self.cam.fps, n)
-        last_seq, frame_i, fps, t_prev, errors = -1, 0, 0.0, time.monotonic(), 0
+        fps, t_prev, errors = 0.0, time.monotonic(), 0
         while not self.stop.is_set():
             self._handle_commands()
-            r = self.cam.read(last_seq, timeout=1.0)
-            if r is None:
-                if self.cam.eof:
-                    self._emit({"status": "End of video"})
-                    return
+            if self.cam is None:
+                self.stop.wait(0.1)
                 continue
-            last_seq, _, frame = r
+            r = self.cam.read(self._last_seq, timeout=1.0)
+            if r is None:
+                if self.cam.eof and not self._eof_reported:
+                    self._eof_reported = True
+                    self.finish(time.time())
+                    self._emit({"status": "End of video"})
+                elif (not self.cam.eof and not self._stall_reported
+                      and time.monotonic() - self._last_frame_t > 3.0):
+                    self._stall_reported = True
+                    self._emit({"status": "No frames from the camera – is it in use or blocked "
+                                          "by Windows privacy settings? Try 'Use test video'."})
+                continue
+            self._last_frame_t, self._stall_reported = time.monotonic(), False
+            self._last_seq, _, frame = r
             now = time.time()
-            if frame_i % n == 0:
+            frame_i = self._frame_i
+            self._frame_i += 1
+            if frame_i % self._every == 0:
                 try:
                     self._cycle(frame, now)
                     errors = 0
@@ -191,7 +239,6 @@ class Pipeline:
                     log.exception("Detection cycle failed (%d in a row)", errors)
                     if errors >= 20:
                         raise
-            frame_i += 1
 
             t = time.monotonic()
             fps = 0.9 * fps + 0.1 / max(t - t_prev, 1e-3)
@@ -204,14 +251,37 @@ class Pipeline:
                 cmd = self.commands.get_nowait()
             except queue.Empty:
                 return
-            if cmd == "reset_db":
-                self.db.reset()
-                self._new_reid()
-                self.states.clear()   # everyone in view gets re-decided as a fresh visitor
-                self._track_profile.clear()
+            if cmd == "clear_view":
+                self._view_since = time.time()
                 self.banner = self.last_event = None
                 self._stats_ts = 0.0
+            elif cmd == "reset_db":
+                self._reset_visitors()
                 log.info("Visitor database cleared from UI")
+            elif isinstance(cmd, tuple) and cmd[0] == "source" and cmd[1] is None:
+                self.finish(time.time())
+                if self.cam is not None:
+                    self.cam.release()
+                    self.cam = None
+                self._emit({"status": "Stopped"})
+            elif isinstance(cmd, tuple) and cmd[0] == "source":
+                self.finish(time.time())
+                self.tracker.tracks = []    # old source's people must not carry over
+                self._switch_db(cmd[1])
+                self._clear_session()
+                self._open_source(cmd[1])
+
+    def _reset_visitors(self):
+        self.db.reset()
+        self._new_reid()
+        self._clear_session()
+
+    def _clear_session(self):
+        self.states.clear()   # everyone in view gets re-decided as a fresh visitor
+        self._track_profile.clear()
+        self.banner = self.last_event = None
+        self._stats_ts = 0.0
+        self._view_since = 0.0
 
     # ── one detection cycle ───────────────────────────────────────────────
     def _cycle(self, frame, now):
@@ -223,7 +293,8 @@ class Pipeline:
         roi, bounds = None, (0, 0, W, H)
         if zone is not None:
             x, y, w, h = cv2.boundingRect(zone.astype(np.int32))
-            roi = (max(0, x - c.ROI_PAD), max(0, y - c.ROI_PAD), min(W, x + w + c.ROI_PAD), min(H, y + h + c.ROI_PAD))
+            top = 0 if c.ZONE_ANCHOR == "bottom" else max(0, y - c.ROI_PAD)   # floor zone: bodies stand above it
+            roi = (max(0, x - c.ROI_PAD), top, min(W, x + w + c.ROI_PAD), min(H, y + h + c.ROI_PAD))
             bounds = roi
 
         dets = self.detector.detect(frame, roi)
@@ -300,6 +371,7 @@ class Pipeline:
             return
         now_thumb = make_thumb(st.best_crop) if st.best_crop is not None else None
         if d.kind == "match":
+            first_today = self.reid.profiles[d.profile_id]["last_seen"] < _midnight_ts()
             new_visit = self.reid.commit_match(d.profile_id, emb, d.similarity, q, now, st.track_id)
             st.profile_id, st.similarity = d.profile_id, d.similarity
             st.status = "recognised" if new_visit else "known"
@@ -308,15 +380,18 @@ class Pipeline:
                 self.banner = {"profile_id": d.profile_id, "similarity": d.similarity,
                                "visits": visits, "until": now + c.BANNER_SECONDS}
                 self._set_event("recognised", d.profile_id, d.similarity, visits, now,
-                                self.db.get_thumb(d.profile_id), now_thumb)
+                                self.db.get_thumb(d.profile_id), now_thumb, first_today)
             log.info("Track %d → visitor #%d (%.2f, %s)", st.track_id, d.profile_id, d.similarity, st.status)
+            if first_today:
+                self._cue(d.profile_id, False, now)
         else:
             thumb = now_thumb if c.STORE_THUMBNAILS else None
             pid = self.reid.commit_new(emb, q, now, st.track_id, thumb)
             st.profile_id, st.similarity, st.status = pid, None, "new"
-            self._set_event("new", pid, d.similarity, 1, now, None, now_thumb)
+            self._set_event("new", pid, d.similarity, 1, now, None, now_thumb, True)
             log.info("Track %d → NEW visitor #%d (closest existing %.2f)", st.track_id, pid, d.similarity)
             self._api_new_person(pid, now)
+            self._cue(pid, True, now)
 
         self._track_profile[st.track_id] = st.profile_id
         if c.SAVE_CROPS:
@@ -325,10 +400,15 @@ class Pipeline:
         st.best_crop = None
         self._stats_ts = 0.0  # refresh stats promptly
 
-    def _set_event(self, kind, pid, sim, visits, ts, then_jpg, now_jpg):
+    def _set_event(self, kind, pid, sim, visits, ts, then_jpg, now_jpg, first_today):
         seq = (self.last_event or {}).get("seq", 0) + 1
         self.last_event = {"seq": seq, "kind": kind, "profile_id": pid, "similarity": sim,
-                           "visits": visits, "ts": ts, "then": then_jpg, "now": now_jpg}
+                           "visits": visits, "ts": ts, "then": then_jpg, "now": now_jpg,
+                           "first_today": first_today}
+
+    def _cue(self, pid, first_ever, now):
+        if self.cfg.AUDIO_CUE_ENABLED:
+            self._api.submit(play_cue, self.cfg, pid, first_ever, now)
 
     def _on_track_end(self, track, now):
         st = self.states.pop(track.id, None)
@@ -412,7 +492,8 @@ class Pipeline:
 
     def stats_snapshot(self, now, fps):
         if now - self._stats_ts >= self.cfg.STATS_REFRESH_S or now < self._stats_ts:
-            self._stats = self.db.stats()
+            self._stats = self.db.stats(since=self._view_since)
+            self._stats["since"] = self._view_since
             for r in self._stats["recent"]:
                 r["thumb"] = self.db.get_thumb(r["id"])
             self._stats_ts = now
@@ -448,7 +529,7 @@ class Pipeline:
         for st in list(self.states.values()):
             if st.profile_id is not None and hasattr(self, "reid"):
                 self.reid.flush(st.profile_id)
-        if hasattr(self, "cam"):
+        if self.cam is not None:
             self.cam.release()
         if hasattr(self, "db"):
             self.db.close()

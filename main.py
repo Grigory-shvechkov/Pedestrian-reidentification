@@ -3,10 +3,12 @@
     python main.py                      # webcam CAMERA_INDEX from config.py
     python main.py --source 1           # another webcam
     python main.py --source clip.mp4    # a recorded video (great for testing)
-    python main.py --keep-db            # don't wipe visitors on start
+    python main.py --reset-db           # start with an empty visitor list
 
-Left: live view. Optional zone: "Draw zone", drag the corners (or drag inside
-to move it); only people inside are counted. Right: who was just seen, whether
+Left: live view. Optional floor zone: "Draw zone", drag the 4 corners into any
+quadrilateral (or drag inside to move it); only people whose feet are inside are
+counted. Zones are saved per source. Someone not seen yet today triggers the audio
+cue (src/audio_cue.py). Right: who was just seen, whether
 they were seen before (stored photo vs. now), and visitor stats.
 """
 from __future__ import annotations
@@ -14,10 +16,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import io
+import json
 import logging
 import queue
 import threading
 import tkinter as tk
+from pathlib import Path
 from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
@@ -61,6 +65,8 @@ class App:
         self._event_seq = None
         self._thumb_cache: dict[int, ImageTk.PhotoImage] = {}
         self._event_photos = []
+        self._stopped = False
+        self._webcam = config.CAMERA_INDEX if isinstance(config.CAMERA_INDEX, int) else 0
 
         self._build_ui()
         self.pipeline = Pipeline(config, self.q, self.zone, self.stop, display_size=lambda: self._display)
@@ -85,6 +91,11 @@ class App:
         self.edit_btn.pack(side=tk.LEFT)
         ttk.Button(bar, text="Clear zone", command=self.clear_zone).pack(side=tk.LEFT, padx=4)
         ttk.Button(bar, text="Reset visitors", command=self.reset_db).pack(side=tk.LEFT, padx=4)
+        ttk.Separator(bar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        ttk.Button(bar, text="Use webcam", command=lambda: self.set_source(self._webcam)).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Use test video", command=lambda: self.set_source(config.TEST_VIDEO)).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Button(bar, text="Stop", command=self.stop_source).pack(side=tk.LEFT)
         self.status = ttk.Label(bar, text="Starting…")
         self.status.pack(side=tk.LEFT, padx=12)
 
@@ -94,22 +105,22 @@ class App:
         self.canvas.bind("<Configure>", self._on_resize)
         self.canvas.bind("<ButtonPress-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", lambda e: setattr(self, "_drag", None))
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
         paned.add(left, weight=4)
 
-        # scrollable right panel
-        right = ttk.Frame(paned, width=380)
-        sc = tk.Canvas(right, highlightthickness=0, width=360)
+        # scrollable right panel: everything lives in one frame inside a canvas
+        right = self.right = ttk.Frame(paned, width=380)
+        sc = self.panel_canvas = tk.Canvas(right, highlightthickness=0, width=360)
         sb = ttk.Scrollbar(right, orient=tk.VERTICAL, command=sc.yview)
         f = self.panel = ttk.Frame(sc)
-        f.bind("<Configure>", lambda e: sc.configure(scrollregion=sc.bbox("all")))
-        sc.create_window((0, 0), window=f, anchor=tk.NW)
+        win = sc.create_window((0, 0), window=f, anchor=tk.NW)
+        f.bind("<Configure>", lambda e: sc.configure(scrollregion=(0, 0, e.width, e.height)))
+        sc.bind("<Configure>", lambda e: sc.itemconfigure(win, width=e.width))
         sc.configure(yscrollcommand=sb.set)
-        sc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         sb.pack(side=tk.RIGHT, fill=tk.Y)
-        sc.bind("<Enter>", lambda e: sc.bind_all("<MouseWheel>",
-                                                 lambda ev: sc.yview_scroll(int(-ev.delta / 120), "units")))
-        sc.bind("<Leave>", lambda e: sc.unbind_all("<MouseWheel>"))
+        sc.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # bind_all + pointer check: <Enter>/<Leave> on the canvas fire when crossing child widgets
+        self.root.bind_all("<MouseWheel>", self._on_panel_wheel, add="+")
         paned.add(right, weight=1)
 
         self.warn_var = tk.StringVar(value="")
@@ -117,7 +128,10 @@ class App:
         self.warn.pack(anchor=tk.W, padx=10)
 
         # latest decision: then / now
-        ttk.Label(f, text="Last person", font=("Segoe UI", 13, "bold")).pack(anchor=tk.W, padx=10, pady=(10, 2))
+        head = ttk.Frame(f)
+        head.pack(fill=tk.X, padx=10, pady=(10, 2))
+        ttk.Label(head, text="Last person", font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT)
+        ttk.Button(head, text="Clear panel", command=self.clear_panel).pack(side=tk.RIGHT)
         self.event_var = tk.StringVar(value="Nobody yet")
         self.event_lbl = tk.Label(f, textvariable=self.event_var, font=("Segoe UI", 12, "bold"),
                                   justify=tk.LEFT, anchor=tk.W)
@@ -129,7 +143,11 @@ class App:
         self.then_img.pack(side=tk.LEFT, padx=(0, 8))
         self.now_img.pack(side=tk.LEFT)
 
-        ttk.Label(f, text="Visitors", font=("Segoe UI", 13, "bold")).pack(anchor=tk.W, padx=10, pady=(12, 4))
+        vhead = ttk.Frame(f)
+        vhead.pack(fill=tk.X, padx=10, pady=(12, 4))
+        ttk.Label(vhead, text="Visitors", font=("Segoe UI", 13, "bold")).pack(side=tk.LEFT)
+        self.since_var = tk.StringVar(value="")
+        ttk.Label(vhead, textvariable=self.since_var, foreground="#666").pack(side=tk.LEFT, padx=8)
         self.vars = {}
         for key, label in [("in_view", "In view now"), ("unique_visitors", "Unique visitors"),
                            ("visits_today", "Visits today"), ("new_today", "New today"),
@@ -150,6 +168,7 @@ class App:
             self.tree.heading(col, text=text)
             self.tree.column(col, width=w, anchor=tk.CENTER)
         self.tree.pack(fill=tk.X, padx=10)
+        self.tree.bind("<MouseWheel>", self._on_panel_wheel)   # the panel scrolls, not the list
 
         ttk.Label(f, text="System", font=("Segoe UI", 11, "bold")).pack(anchor=tk.W, padx=10, pady=(14, 4))
         self.sys_var = tk.StringVar(value="")
@@ -176,23 +195,96 @@ class App:
         self.editing = not self.editing
         self.edit_btn.configure(text="Done" if self.editing else "Edit zone")
         if self.editing and self.zone_pts is None:
-            fw, fh = self.frame_size
-            mx, my = fw * 0.25, fh * 0.1
-            self.zone_pts = [[mx, my], [fw - mx, my], [fw - mx, fh - my], [mx, fh - my]]
+            fw, fh = self.frame_size   # starting shape: a floor-like trapezoid in the lower part
+            self.zone_pts = [[fw * 0.3, fh * 0.55], [fw * 0.7, fh * 0.55], [fw * 0.8, fh * 0.9], [fw * 0.2, fh * 0.9]]
             self.zone.set(self.zone_pts)
+        if not self.editing:
+            self._save_zone()
         self._draw_zone()
 
     def clear_zone(self):
+        self._reset_zone()
+        self._save_zone()
+
+    def _reset_zone(self):
         self.zone_pts = None
         self.editing = False
         self.edit_btn.configure(text="Draw zone")
         self.zone.set(None)
         self._draw_zone()
 
+    # zones.json: {source: {"size": [w, h], "pts": [[x, y] x 4]}} in frame pixels
+    def _zone_key(self):
+        src = config.CAMERA_INDEX
+        return str(Path(src).resolve()) if isinstance(src, str) and Path(src).exists() else str(src)
+
+    def _read_zones(self):
+        try:
+            return json.loads(Path(config.ZONES_PATH).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _save_zone(self):
+        zones = self._read_zones()
+        if self.zone_pts is None or self.frame_size is None:
+            zones.pop(self._zone_key(), None)
+        else:
+            zones[self._zone_key()] = {"size": list(self.frame_size), "pts": self.zone_pts}
+        path = Path(config.ZONES_PATH)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(zones, indent=1), encoding="utf-8")
+
+    def _load_zone(self):
+        z = self._read_zones().get(self._zone_key())
+        if not z or len(z.get("pts", [])) != 4:
+            return
+        sx, sy = self.frame_size[0] / z["size"][0], self.frame_size[1] / z["size"][1]
+        self.zone_pts = [[x * sx, y * sy] for x, y in z["pts"]]
+        self.zone.set(self.zone_pts)
+        self.edit_btn.configure(text="Edit zone")
+
     def reset_db(self):
         if messagebox.askyesno("Reset visitors", "Forget every stored visitor?"):
             self.pipeline.commands.put("reset_db")
             self._thumb_cache.clear()
+
+    def _on_panel_wheel(self, e):
+        if not str(e.widget).startswith(str(self.right)):
+            return
+        sc = self.panel_canvas
+        if self.panel.winfo_height() > sc.winfo_height():
+            sc.yview_scroll(int(-e.delta / 120), "units")
+        return "break"
+
+    def set_source(self, new):
+        if isinstance(new, str) and not Path(new).is_file():
+            messagebox.showerror("Video missing", f"Not found:\n{new}")
+            return
+        config.CAMERA_INDEX = new
+        self._clear_view()
+        self._stopped = False
+        self.pipeline.commands.put(("source", new))
+
+    def stop_source(self):
+        self._stopped = True         # frames already queued must not repaint the canvas
+        self._clear_view()
+        self.pipeline.commands.put(("source", None))
+
+    def _clear_view(self):
+        self._reset_zone()           # the next source's saved zone loads with its first frame
+        self.frame_size = None
+        self._thumb_cache.clear()
+        self._photo = None
+        self.canvas.itemconfigure(self.img_item, image="")
+
+    def clear_panel(self):
+        """Empty the panel and count from now on; stored visitors are kept for recognition."""
+        self.pipeline.commands.put("clear_view")
+        self._recent_key = None
+        self.tree.delete(*self.tree.get_children())
+        for v in self.vars.values():
+            v.set("0")
+        self._show_event(None)
 
     def _draw_zone(self):
         self.canvas.delete("zone")
@@ -216,6 +308,11 @@ class App:
         if self._inside(e.x, e.y):
             self._drag = ("move", self._to_frame(e.x, e.y))
 
+    def _on_release(self, e):
+        if self._drag:
+            self._save_zone()
+        self._drag = None
+
     def _inside(self, x, y):
         pts = [self._to_canvas(*p) for p in self.zone_pts]
         inside, j = False, len(pts) - 1
@@ -231,7 +328,12 @@ class App:
             return
         fx, fy = self._to_frame(e.x, e.y)
         if self._drag[0] == "vertex":
-            self.zone_pts[self._drag[1]] = [fx, fy]
+            fw, fh = self.frame_size
+            pts = [list(p) for p in self.zone_pts]
+            pts[self._drag[1]] = [min(max(fx, 0), fw - 1), min(max(fy, 0), fh - 1)]
+            if not _is_simple_quad(pts):
+                return   # edges would cross (bow-tie): keep the last valid shape
+            self.zone_pts = pts
         else:
             sx, sy = self._drag[1]
             fw, fh = self.frame_size
@@ -267,6 +369,8 @@ class App:
             self.root.after(config.UI_POLL_MS, self.poll)
 
     def _show(self, p):
+        if self._stopped:
+            return
         first = self.frame_size is None
         self.frame_size = p["frame_size"]
         _, ox, oy = self._mapping()
@@ -274,6 +378,7 @@ class App:
         self.canvas.itemconfigure(self.img_item, image=self._photo)
         self.canvas.coords(self.img_item, int(ox), int(oy))
         if first:
+            self._load_zone()
             self._draw_zone()
         self.canvas.tag_raise("zone")
 
@@ -284,6 +389,7 @@ class App:
         self.warn_var.set(s.get("warning", ""))
         self.sys_var.set(f"FPS: {s['fps']:.1f}\nRe-ID model: {s['backend']}\n"
                          f"Match threshold: {s['threshold']:.2f}")
+        self.since_var.set(f"since {_fmt(s['since'])}" if s.get("since") else "")
         self._show_recent(s.get("recent", []))
         self._show_event(p.get("event"))
 
@@ -293,6 +399,7 @@ class App:
             return
         self._recent_key = key
         self.tree.delete(*self.tree.get_children())
+        self.tree.configure(height=max(1, len(recent)))
         for r in recent:
             if r["id"] not in self._thumb_cache and r.get("thumb"):
                 self._thumb_cache[r["id"]] = _jpg_to_photo(r["thumb"], LIST_IMG)
@@ -316,13 +423,14 @@ class App:
         self._event_photos = [now_ph, then_ph]   # keep references alive
         when = _fmt(ev["ts"])
         if ev["kind"] == "recognised":
+            today = "first time today – audio cue" if ev.get("first_today") else "already seen today"
             self.event_var.set(f"SEEN BEFORE – visitor #{ev['profile_id']}\n"
-                               f"match {ev['similarity'] * 100:.0f}%, visit {ev['visits']}  ({when})")
+                               f"match {ev['similarity'] * 100:.0f}%, visit {ev['visits']}  ({when})\n{today}")
             self.event_lbl.configure(fg="#c0288c")
             self.then_img.configure(image=then_ph or "", text="stored photo")
         else:
             closest = f"closest existing {ev['similarity'] * 100:.0f}%" if ev["similarity"] > -1 else "gallery empty"
-            self.event_var.set(f"NEW visitor #{ev['profile_id']}\n{closest}  ({when})")
+            self.event_var.set(f"NEW visitor #{ev['profile_id']}\n{closest}  ({when})\nnot seen today – audio cue")
             self.event_lbl.configure(fg="#1d8a1d")
             self.then_img.configure(image="", text="(first time)")
         self.now_img.configure(image=now_ph or "", text="now")
@@ -333,6 +441,17 @@ class App:
         self.root.destroy()
 
 
+def _is_simple_quad(pts):
+    """False if the quadrilateral's opposite edges cross."""
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    def crosses(p1, p2, p3, p4):
+        return cross(p3, p4, p1) * cross(p3, p4, p2) < 0 and cross(p1, p2, p3) * cross(p1, p2, p4) < 0
+
+    return not crosses(pts[0], pts[1], pts[2], pts[3]) and not crosses(pts[1], pts[2], pts[3], pts[0])
+
+
 def _fmt(ts):
     d = dt.datetime.fromtimestamp(ts)
     return d.strftime("%H:%M:%S") if d.date() == dt.date.today() else d.strftime("%d %b %H:%M")
@@ -341,12 +460,12 @@ def _fmt(ts):
 def parse_args():
     ap = argparse.ArgumentParser(description="Pedestrian profiler")
     ap.add_argument("--source", help="webcam index (e.g. 0) or video file / RTSP URL")
-    ap.add_argument("--keep-db", action="store_true", help="keep visitors from previous runs")
+    ap.add_argument("--reset-db", action="store_true", help="start with an empty visitor list")
     args = ap.parse_args()
     if args.source is not None:
         config.CAMERA_INDEX = int(args.source) if args.source.isdigit() else args.source
-    if args.keep_db:
-        config.DB_RESET_ON_START = False
+    if args.reset_db:
+        config.DB_RESET_ON_START = True
 
 
 if __name__ == "__main__":

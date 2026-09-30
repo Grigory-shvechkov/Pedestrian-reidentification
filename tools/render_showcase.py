@@ -133,6 +133,7 @@ def main():
 
     config.DB_PATH = ROOT / "data" / "showcase.db"
     config.DB_RESET_ON_START = True
+    config.AUDIO_CUE_ENABLED = False
     config.PROFILE_RETENTION_DAYS = None
 
     cap = cv2.VideoCapture(str(args.input))

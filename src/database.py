@@ -60,7 +60,7 @@ def _midnight_ts() -> float:
 
 class VisitorDB:
     def __init__(self, path: Path, reset: bool = False):
-        path = Path(path)
+        path = self.path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self.conn = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
@@ -191,18 +191,20 @@ class VisitorDB:
         with self._lock:
             return self.conn.execute("SELECT COUNT(*) FROM visitors").fetchone()[0]
 
-    def stats(self, recent: int = 15) -> dict:
-        t0 = _midnight_ts()
-        hour_ago = time.time() - 3600
+    def stats(self, recent: int = 15, since: float = 0.0) -> dict:
+        """`since`: only count activity from this time on (the UI's "Clear panel")."""
+        t0 = max(_midnight_ts(), since)
+        hour_ago = max(time.time() - 3600, since)
         with self._lock:
             c = self.conn
-            unique = c.execute("SELECT COUNT(*) FROM visitors").fetchone()[0]
+            unique = c.execute("SELECT COUNT(*) FROM visitors WHERE last_seen>=?", (since,)).fetchone()[0]
             visits_today = c.execute("SELECT COUNT(*) FROM visits WHERE ts>=?", (t0,)).fetchone()[0]
             new_today = c.execute("SELECT COUNT(*) FROM visits WHERE ts>=? AND is_new=1", (t0,)).fetchone()[0]
             last_hour = c.execute("SELECT COUNT(*) FROM visits WHERE ts>=?", (hour_ago,)).fetchone()[0]
-            returning = c.execute("SELECT COUNT(*) FROM visitors WHERE visit_count>1").fetchone()[0]
-            rows = c.execute("SELECT id, first_seen, last_seen, visit_count FROM visitors "
-                             "ORDER BY last_seen DESC LIMIT ?", (recent,)).fetchall()
+            returning = c.execute("SELECT COUNT(*) FROM visitors WHERE visit_count>1 AND last_seen>=?",
+                                  (since,)).fetchone()[0]
+            rows = c.execute("SELECT id, first_seen, last_seen, visit_count FROM visitors WHERE last_seen>=? "
+                             "ORDER BY last_seen DESC LIMIT ?", (since, recent)).fetchall()
         return {
             "unique_visitors": unique,
             "visits_today": visits_today,
