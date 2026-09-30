@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+*.tmp.mp4
+data/*.db*
+data/crops/
+data/one-by-one-person-detection.mp4
+*.pt
+models/*.pth
+!models/.gitkeep
+!data/.gitkeep

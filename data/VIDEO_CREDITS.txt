@@ -1,0 +1,5 @@
+videos/test_reid.mp4 (and videos/showcase.mp4, which is the system output on it) are built by tools/make_test_video.py / tools/render_showcase.py from
+"one-by-one-person-detection.mp4", Intel IoT DevKit sample videos
+https://github.com/intel-iot-devkit/sample-videos
+Licensed under Creative Commons Attribution 4.0 International (CC BY 4.0).
+Changes: upscaled to 960x540; played twice, the second time mirrored, re-lit and slightly zoomed.

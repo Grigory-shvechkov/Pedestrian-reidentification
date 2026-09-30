@@ -1,0 +1,56 @@
+{
+  // Run & Debug panel (Ctrl+Shift+D) → pick a configuration → F5
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "▶ Profiler – test video",
+      "type": "debugpy", "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["--source", "videos/test_reid.mp4"],
+      "cwd": "${workspaceFolder}", "console": "integratedTerminal", "justMyCode": true
+    },
+    {
+      "name": "▶ Profiler – webcam",
+      "type": "debugpy", "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "cwd": "${workspaceFolder}", "console": "integratedTerminal", "justMyCode": true
+    },
+    {
+      "name": "▶ Profiler – webcam, keep visitors",
+      "type": "debugpy", "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["--keep-db"],
+      "cwd": "${workspaceFolder}", "console": "integratedTerminal", "justMyCode": true
+    },
+    {
+      "name": "▶ Profiler – choose video…",
+      "type": "debugpy", "request": "launch",
+      "program": "${workspaceFolder}/main.py",
+      "args": ["--source", "${input:videoPath}"],
+      "cwd": "${workspaceFolder}", "console": "integratedTerminal", "justMyCode": true
+    },
+    {
+      "name": "✔ Self-test",
+      "type": "debugpy", "request": "launch",
+      "program": "${workspaceFolder}/tools/selftest.py",
+      "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+    },
+    {
+      "name": "🎬 Render showcase video",
+      "type": "debugpy", "request": "launch",
+      "program": "${workspaceFolder}/tools/render_showcase.py",
+      "args": ["--gif", "videos/showcase_preview.gif"],
+      "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+    },
+    {
+      "name": "📏 Calibrate threshold (data/crops)",
+      "type": "debugpy", "request": "launch",
+      "program": "${workspaceFolder}/tools/calibrate_threshold.py",
+      "args": ["data/crops"],
+      "cwd": "${workspaceFolder}", "console": "integratedTerminal"
+    }
+  ],
+  "inputs": [
+    {"id": "videoPath", "type": "promptString", "description": "Video file or webcam index", "default": "videos/test_reid.mp4"}
+  ]
+}

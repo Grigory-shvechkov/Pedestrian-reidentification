@@ -1,0 +1,7 @@
+ultralytics>=8.1     # YOLOv8 person detector (also installs torch, torchvision, scipy)
+opencv-python>=4.8
+numpy
+scipy
+Pillow
+gdown                # one-time download of the OSNet re-ID weights (Google Drive)
+imageio-ffmpeg       # H.264 encoding for the showcase / test videos (optional)

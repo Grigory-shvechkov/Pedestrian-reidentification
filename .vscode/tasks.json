@@ -1,0 +1,27 @@
+{
+  // Terminal → Run Task…
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Setup: create .venv and install requirements",
+      "type": "shell",
+      "windows": {"command": ".\\setup_venv.bat"},
+      "command": "python3 -m venv .venv && .venv/bin/pip install -r requirements.txt",
+      "problemMatcher": []
+    },
+    {
+      "label": "Self-test",
+      "type": "shell",
+      "windows": {"command": ".venv\\Scripts\\python.exe tools\\selftest.py"},
+      "command": ".venv/bin/python tools/selftest.py",
+      "problemMatcher": []
+    },
+    {
+      "label": "Render showcase video",
+      "type": "shell",
+      "windows": {"command": ".venv\\Scripts\\python.exe tools\\render_showcase.py --gif videos\\showcase_preview.gif"},
+      "command": ".venv/bin/python tools/render_showcase.py --gif videos/showcase_preview.gif",
+      "problemMatcher": []
+    }
+  ]
+}
